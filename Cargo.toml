@@ -1,0 +1,4 @@
+[package]
+authors = ["Austin Bonander <austin.bonander@gmail.com>"]
+name = "thread-stack"
+version = "0.1.0"

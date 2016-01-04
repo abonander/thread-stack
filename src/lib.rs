@@ -1,118 +1,185 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, Receiver, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, LockResult, PoisonError};
+use std::{mem, thread};
 
-#[derive(Clone)]
 pub struct Stack<T> {
-    push: SyncSender<T>,
-    pop: Arc<Pop<T>>,
+    inner: Arc<Inner<T>>,
 }
 
 impl<T: Send + 'static> Stack<T> {
     pub fn new() -> Self {
-       Self::with_buf_size(0)
-    }
-
-    pub fn with_buf_size(buf_size: usize) -> Self {
-        let (push_tx, push_rx) = mpsc::sync_channel(buf_size);
-        let pop = Arc::new(Pop::new());
+        let inner = Arc::new(Inner::new());
 
         Server {
-            push: push_rx,
-            pop: pop.clone(),
+            inner: inner.clone(),
         }.start();
 
         Stack {
-            push: push_tx,
-            pop: pop,
+            inner: inner,
         }
     }
 
     pub fn pop(&self) -> Option<T> {
-        self.pop.pop()
+        self.inner.pop()
     }
 
     pub fn push(&self, val: T) {
-        self.push.send(val).unwrap();
+        self.inner.push(val);
     }
 }
 
-struct Pop<T> {
+impl<T> Clone for Stack<T> {
+    fn clone(&self) -> Self {
+        self.inner.new_client();
+
+        Stack {
+            inner: self.inner.clone()
+        }
+    }
+}
+
+impl<T> Drop for Stack<T> {
+    fn drop(&mut self) {
+        self.inner.client_dropped();
+    }
+}
+
+struct Inner<T> {
+    clients: AtomicUsize,
     len: AtomicUsize,
-    cvar: Condvar,
+    server: Condvar,
     val: Mutex<Option<T>>,
 }
 
-impl<T> Pop<T> {
+impl<T> Inner<T> {
     fn new() -> Self {
-        Pop {
+        Inner {
+            clients: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
-            cvar: Condvar::new(),
+            server: Condvar::new(),
             val: Mutex::new(None),
         }
     }
 
     fn pop(&self) -> Option<T> {
         let mut maybe = None;
-        let mut guard = None;
+        let mut guard = self.val.lock().unwrap();
 
         while maybe.is_none() {
             if self.len.load(Ordering::Relaxed) == 0 {
                 break;
             }
 
-            let mut guard_ = guard.unwrap_or_else(|| self.val.lock().unwrap());
-
-            maybe = guard_.take();
+            maybe = guard.take();
 
             if maybe.is_some() {
+                self.len.fetch_sub(1, Ordering::Relaxed);
                 break;
             }
 
-            guard = Some(self.cvar.wait(guard_).unwrap());
+            drop(guard);
+
+            self.server.notify_one();
+
+            guard = self.val.lock().unwrap();
         }
 
+        drop(guard);
+
+        self.server.notify_one();
+
         maybe
+    }
+
+    fn push(&self, val: T) {
+        let mut guard = self.val.lock().unwrap();
+        
+        while guard.is_some() {
+            drop(guard);
+            self.server.notify_one();
+            guard = self.val.lock().unwrap();
+        }
+
+        *guard = Some(val);
+
+        self.len.fetch_add(1, Ordering::Relaxed);
+
+        drop(guard);
+        self.server.notify_one();
+    }
+
+    fn new_client(&self) {
+        self.clients.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn client_dropped(&self) {
+        if self.clients.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.server.notify_one();
+        }
+    }
+ 
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    fn clients(&self) -> usize {
+        self.clients.load(Ordering::Relaxed)
     }
 }
 
 struct Server<T> {
-    push: Receiver<T>,
-    pop: Arc<Pop<T>>,
+    inner: Arc<Inner<T>>,
 }
 
 impl<T: Send + 'static> Server<T> {
     fn start(self) {
-        thread::spawn(move || { self.serve(0); });
+        thread::spawn(move || { 
+            self.serve(0, self.inner.val.lock().unwrap());
+        });
     }
 
-    fn serve(&self, len: usize) -> Option<MutexGuard<Option<T>>> {
+    fn serve<'a>(&'a self, len: usize, mut guard: MutexGuard<'a, Option<T>>) -> LockResult<MutexGuard<'a, Option<T>>> {
+        let mut val = None;
         loop {
-            self.store_len(len);
-            
-            match self.push.try_recv() {
-                Ok(val) => if let Some(mut guard) = self.serve(len + 1) {
-                    *guard = Some(val);
-                    drop(guard);
-                    self.store_len(len);
-                    self.pop.cvar.notify_one();
-                } else { 
-                    return None;
-                },
-                Err(TryRecvError::Empty) => {
-                    let guard = self.pop.val.lock().unwrap();
+            guard = try!(self.inner.server.wait(guard));
 
-                    if guard.is_none() {
-                        return Some(guard);
-                    }
-                },
-                Err(TryRecvError::Disconnected) => return None,
+            if self.inner.clients() == 0 {
+                return Err(PoisonError::new(guard));
+            }
+
+            let len_ = self.inner.len();
+            
+            if len_ > len { 
+                guard = try!(self.serve(len + 1, guard));
+            } else if len_ < len {
+                return Ok(guard);
+            }
+
+            if guard.is_some() != val.is_some() {
+                mem::swap(&mut val, &mut guard);
             }
         }
     }
+}
 
-    fn store_len(&self, len: usize) {
-        self.pop.len.store(len, Ordering::Relaxed);
+#[test]
+fn test_stack_basic() {
+    let vals: Vec<u64> = (0 .. 5).collect();
+
+    let stack = Stack::new();
+
+    for &val in vals.iter().rev() {
+        stack.push(val);
+        println!("Push!");
     }
+
+    let mut out_vals = Vec::new();
+
+    while let Some(out) = stack.pop() {
+        println!("Pop!");
+        out_vals.push(out);
+    }
+
+    assert_eq!(vals, out_vals);
 }
